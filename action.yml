@@ -31,6 +31,14 @@ inputs:
     description: 'Output format: github (summary table + annotations), text, or json.'
     required: false
     default: 'github'
+  max-comment-rows:
+    description: >-
+      Maximum table rows in the sticky PR comment, most significant first
+      (0 = unlimited). The step summary always keeps the full table. GitHub
+      rejects comment bodies over 65536 characters, so an uncapped table on a
+      large diff fails to post.
+    required: false
+    default: '0'
 
 runs:
   using: 'composite'
@@ -65,6 +73,7 @@ runs:
         INPUT_FAIL_ON_INCREASE: ${{ inputs.fail-on-increase }}
         INPUT_FORMAT: ${{ inputs.format }}
         INPUT_TARGETS: ${{ inputs.targets }}
+        INPUT_MAX_COMMENT_ROWS: ${{ inputs.max-comment-rows }}
         DIFF_ARG: ${{ steps.prepare.outputs.diff_arg }}
         ACTION_PATH: ${{ github.action_path }}
         GH_TOKEN: ${{ github.token }}
@@ -74,7 +83,25 @@ runs:
         if [ "$INPUT_FAIL_ON_INCREASE" = "true" ]; then
           fail_inc_arg="--fail-on-increase"
         fi
-        
+
+        case "${INPUT_MAX_COMMENT_ROWS:-0}" in
+          ''|*[!0-9]*)
+            echo "::error::max-comment-rows must be a non-negative integer, got '${INPUT_MAX_COMMENT_ROWS}'."
+            exit 1
+            ;;
+        esac
+
+        # When a row cap is requested, the scanner renders a second, trimmed
+        # report for the PR comment while the step summary keeps every row.
+        # Absolute path: the scanner runs with the action directory as cwd.
+        # An array keeps the path intact even if RUNNER_TEMP contains spaces.
+        comment_args=()
+        comment_file=""
+        if [ "$INPUT_FORMAT" = "github" ] && [ "${INPUT_MAX_COMMENT_ROWS:-0}" -gt 0 ]; then
+          comment_file="${RUNNER_TEMP}/complexity-comment.md"
+          comment_args=(--comment-output="$comment_file" --max-comment-rows="$INPUT_MAX_COMMENT_ROWS")
+        fi
+
         # Navigate to action repo directory, run pub get to resolve dependencies deterministically
         cd "$ACTION_PATH"
         dart pub get >/dev/null
@@ -93,13 +120,21 @@ runs:
           --format="$INPUT_FORMAT" \
           $DIFF_ARG \
           $fail_inc_arg \
+          "${comment_args[@]}" \
           $targets
         exit_code=$?
         set -e
 
         # If running inside a PR context and GH_TOKEN is present, post or update sticky comment
         if [ -n "$PR_NUMBER" ] && [ -n "$GH_TOKEN" ]; then
-          if [ -f "$GITHUB_STEP_SUMMARY" ] && [ -s "$GITHUB_STEP_SUMMARY" ]; then
+          # Prefer the trimmed report when a row cap produced one; the step
+          # summary keeps the full table either way.
+          body_file="$GITHUB_STEP_SUMMARY"
+          if [ -n "$comment_file" ] && [ -s "$comment_file" ]; then
+            body_file="$comment_file"
+          fi
+
+          if [ -f "$body_file" ] && [ -s "$body_file" ]; then
             echo "Searching for existing complexity audit comment on PR #$PR_NUMBER..."
 
             # Find the ID of any existing comment containing our tracking marker.
@@ -113,10 +148,10 @@ runs:
 
             if [ -n "$comment_id" ]; then
               echo "Updating existing comment (ID: $comment_id)..."
-              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@"$GITHUB_STEP_SUMMARY" > /dev/null || true
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@"$body_file" > /dev/null || true
             else
               echo "Creating new PR comment..."
-              gh pr comment "$PR_NUMBER" --body-file "$GITHUB_STEP_SUMMARY" --repo "$GITHUB_REPOSITORY" > /dev/null || true
+              gh pr comment "$PR_NUMBER" --body-file "$body_file" --repo "$GITHUB_REPOSITORY" > /dev/null || true
             fi
           fi
         fi

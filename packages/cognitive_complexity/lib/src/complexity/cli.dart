@@ -63,6 +63,23 @@ Future<int> runCli(
       defaultsTo: 'text',
       allowed: ['text', 'json', 'github'],
       help: 'Output format.',
+    )
+    ..addOption(
+      'comment-output',
+      valueHelp: 'path',
+      help:
+          'With --format=github, also write a standalone report to this path, '
+          'ordered by significance and capped by --max-comment-rows. Intended '
+          'for posting as a PR comment while the step summary keeps the full '
+          'table.',
+    )
+    ..addOption(
+      'max-comment-rows',
+      defaultsTo: '0',
+      valueHelp: 'count',
+      help:
+          'Maximum table rows in --comment-output (0 = unlimited). GitHub '
+          'rejects comment bodies over 65536 characters.',
     );
 
   try {
@@ -89,13 +106,19 @@ Future<int> runCli(
     final format = argResults['format'] as String;
     final gitDiffBase = argResults['git-diff'] as String?;
     final failOnIncrease = argResults['fail-on-increase'] as bool;
+    final commentOutput = argResults['comment-output'] as String?;
+    final maxCommentRows = parseNonNegativeInt(
+      argResults['max-comment-rows'] as String,
+      'max-comment-rows',
+    );
 
-    if (failOnIncrease && gitDiffBase == null) {
-      stderrSink.writeln(
-        'Warning: --fail-on-increase has no effect unless --git-diff is '
-        'specified.',
-      );
-    }
+    _warnIgnoredFlags(
+      failOnIncrease: failOnIncrease,
+      commentOutput: commentOutput,
+      format: format,
+      gitDiffBase: gitDiffBase,
+      err: stderrSink,
+    );
 
     if (gitDiffBase != null) {
       if (gitDiffBase.trim().isEmpty) {
@@ -107,6 +130,8 @@ Future<int> runCli(
         format: format,
         failThreshold: failThreshold,
         failOnIncrease: failOnIncrease,
+        commentOutput: commentOutput,
+        maxCommentRows: maxCommentRows,
         out: stdoutSink,
         err: stderrSink,
       );
@@ -133,6 +158,29 @@ Future<int> runCli(
   }
 }
 
+/// Warns about flags that are silently ignored in the current mode.
+void _warnIgnoredFlags({
+  required bool failOnIncrease,
+  required String? commentOutput,
+  required String format,
+  required String? gitDiffBase,
+  required StringSink err,
+}) {
+  if (failOnIncrease && gitDiffBase == null) {
+    err.writeln(
+      'Warning: --fail-on-increase has no effect unless --git-diff is '
+      'specified.',
+    );
+  }
+
+  if (commentOutput != null && (format != 'github' || gitDiffBase == null)) {
+    err.writeln(
+      'Warning: --comment-output has no effect unless --format=github '
+      'and --git-diff are both set.',
+    );
+  }
+}
+
 Future<int> _handleDiffMode({
   required String gitDiffBase,
   required List<String> targets,
@@ -141,6 +189,8 @@ Future<int> _handleDiffMode({
   required bool failOnIncrease,
   required StringSink out,
   required StringSink err,
+  String? commentOutput,
+  int maxCommentRows = 0,
 }) async {
   final deltaAnalyzer = DeltaAnalyzer();
   final summary = await deltaAnalyzer.computeDeltas(
@@ -161,6 +211,8 @@ Future<int> _handleDiffMode({
     final reporter = GitHubReporter(
       stdoutSink: out,
       summaryFile: resolveGitHubSummaryFile(),
+      commentFile: commentOutput == null ? null : File(commentOutput),
+      maxCommentRows: maxCommentRows,
     );
     reporter.printReport(
       deltaSummary: summary,

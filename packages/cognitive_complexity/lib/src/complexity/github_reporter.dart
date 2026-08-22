@@ -6,37 +6,69 @@ import 'delta_analyzer.dart';
 class GitHubReporter {
   final StringSink _stdoutSink;
   final File? _summaryFile;
+  final File? _commentFile;
+  final int _maxCommentRows;
 
-  GitHubReporter({StringSink? stdoutSink, this._summaryFile})
-    : _stdoutSink = stdoutSink ?? stdout;
+  GitHubReporter({
+    StringSink? stdoutSink,
+    this._summaryFile,
+    this._commentFile,
+    this._maxCommentRows = 0,
+  }) : _stdoutSink = stdoutSink ?? stdout;
 
   /// Generates diagnostic workflow annotations and updates step summary table.
+  ///
+  /// The step summary always receives the complete table. When [_commentFile]
+  /// is configured, a second rendering is written there with the most
+  /// significant rows first, capped at [_maxCommentRows]. GitHub rejects
+  /// issue-comment bodies over 65536 characters, so posting an uncapped table
+  /// on a large diff silently fails.
   void printReport({
     List<FunctionComplexity>? regularResults,
     DeltaSummary? deltaSummary,
     int? failThreshold,
     bool failOnIncrease = false,
   }) {
-    final summaryBuf = StringBuffer();
-    summaryBuf.writeln('<!-- complexity-comment-marker -->');
-    summaryBuf.writeln('# 📊 Cognitive Complexity Analysis');
-    summaryBuf.writeln();
+    final summaryBuf = _newBuffer();
+    final commentBuf = _commentFile == null ? null : _newBuffer();
 
     if (deltaSummary != null) {
-      _reportDelta(deltaSummary, failThreshold, failOnIncrease, summaryBuf);
+      _reportDelta(
+        deltaSummary,
+        failThreshold,
+        failOnIncrease,
+        summaryBuf,
+        commentBuf,
+      );
     } else if (regularResults != null) {
       _reportRegular(regularResults, failThreshold, summaryBuf);
     }
 
-    if (_summaryFile != null) {
-      try {
-        _summaryFile.writeAsStringSync(
-          summaryBuf.toString(),
-          mode: FileMode.append,
-        );
-      } catch (e) {
-        stderr.writeln('Warning: Failed to write to step summary file: $e');
-      }
+    _write(_summaryFile, summaryBuf, 'step summary', append: true);
+    if (commentBuf != null) {
+      _write(_commentFile, commentBuf, 'comment output', append: false);
+    }
+  }
+
+  StringBuffer _newBuffer() => StringBuffer()
+    ..writeln('<!-- complexity-comment-marker -->')
+    ..writeln('# 📊 Cognitive Complexity Analysis')
+    ..writeln();
+
+  void _write(
+    File? file,
+    StringBuffer buf,
+    String label, {
+    required bool append,
+  }) {
+    if (file == null) return;
+    try {
+      file.writeAsStringSync(
+        buf.toString(),
+        mode: append ? FileMode.append : FileMode.write,
+      );
+    } catch (e) {
+      stderr.writeln('Warning: Failed to write to $label file: $e');
     }
   }
 
@@ -77,6 +109,7 @@ class GitHubReporter {
     int? failThreshold,
     bool failOnIncrease,
     StringBuffer summaryBuf,
+    StringBuffer? commentBuf,
   ) {
     final net = summary.netDelta;
     final sign = net > 0 ? '+' : '';
@@ -84,35 +117,102 @@ class GitHubReporter {
       failThreshold: failThreshold,
       failOnIncrease: failOnIncrease,
     );
-    summaryBuf.writeln(
-      '**Net Delta**: $sign$net | **Added**: ${summary.countAdded} | '
-      '**Increased**: ${summary.countIncreased} | '
-      '**Improved**: ${summary.countImproved} | **Violations**: $violations',
-    );
-    summaryBuf.writeln();
+    final header =
+        '**Net Delta**: $sign$net | **Added**: ${summary.countAdded} | '
+        '**Increased**: ${summary.countIncreased} | '
+        '**Improved**: ${summary.countImproved} | **Violations**: $violations';
+    for (final buf in [summaryBuf, ?commentBuf]) {
+      buf
+        ..writeln(header)
+        ..writeln();
+    }
+
+    final changed = summary.deltas
+        .where((d) => d.status != DeltaStatus.unchanged)
+        .toList();
+
+    // Annotations are emitted once for every changed declaration, independent
+    // of how many rows each table renders. Capping the comment must not hide
+    // an inline warning from the Files-changed view.
+    for (final d in changed) {
+      _emitDiagnostic(d, failThreshold, failOnIncrease);
+    }
 
     if (summary.deltas.isEmpty) {
-      summaryBuf.writeln('No modified Dart declarations detected.');
+      for (final buf in [summaryBuf, ?commentBuf]) {
+        buf.writeln('No modified Dart declarations detected.');
+      }
       return;
     }
 
-    _renderDeltaTable(summary, failThreshold, failOnIncrease, summaryBuf);
+    _renderDeltaTable(changed, failThreshold, failOnIncrease, summaryBuf);
+
+    if (commentBuf != null) {
+      _renderCappedComment(changed, failThreshold, failOnIncrease, commentBuf);
+    }
+  }
+
+  /// Renders the sticky-comment table: most significant rows first, capped at
+  /// [_maxCommentRows], with a footer pointing at the full step summary when
+  /// rows were omitted.
+  void _renderCappedComment(
+    List<ComplexityDelta> changed,
+    int? failThreshold,
+    bool failOnIncrease,
+    StringBuffer commentBuf,
+  ) {
+    final ranked = [...changed]
+      ..sort((a, b) {
+        final byRank = _rank(
+          b,
+          failThreshold,
+          failOnIncrease,
+        ).compareTo(_rank(a, failThreshold, failOnIncrease));
+        if (byRank != 0) return byRank;
+        return (b.newScore ?? 0).compareTo(a.newScore ?? 0);
+      });
+
+    final capped = _maxCommentRows > 0 && ranked.length > _maxCommentRows
+        ? ranked.sublist(0, _maxCommentRows)
+        : ranked;
+
+    _renderDeltaTable(capped, failThreshold, failOnIncrease, commentBuf);
+
+    if (capped.length < ranked.length) {
+      commentBuf
+        ..writeln()
+        ..writeln(
+          '_Showing the $_maxCommentRows most significant of '
+          '${ranked.length} changed declarations. '
+          'See the workflow Step Summary for the full table._',
+        );
+    }
+  }
+
+  /// Display priority for the capped comment: violations, then regressions,
+  /// then additions, then everything else.
+  int _rank(ComplexityDelta d, int? failThreshold, bool failOnIncrease) {
+    if (d.isViolation(
+      failThreshold: failThreshold,
+      failOnIncrease: failOnIncrease,
+    )) {
+      return 3;
+    }
+    if (d.status == DeltaStatus.increased) return 2;
+    if (d.status == DeltaStatus.added) return 1;
+    return 0;
   }
 
   void _renderDeltaTable(
-    DeltaSummary summary,
+    List<ComplexityDelta> deltas,
     int? failThreshold,
     bool failOnIncrease,
-    StringBuffer summaryBuf,
+    StringBuffer buf,
   ) {
-    summaryBuf.writeln('| Status | Declaration | Location | Delta | Score |');
-    summaryBuf.writeln('| :---: | :--- | :--- | :---: | :---: |');
+    buf.writeln('| Status | Declaration | Location | Delta | Score |');
+    buf.writeln('| :---: | :--- | :--- | :---: | :---: |');
 
-    for (final d in summary.deltas) {
-      if (d.status == DeltaStatus.unchanged) {
-        continue;
-      }
-
+    for (final d in deltas) {
       final isVio = d.isViolation(
         failThreshold: failThreshold,
         failOnIncrease: failOnIncrease,
@@ -124,11 +224,7 @@ class GitHubReporter {
           ? '${d.oldScore} -> **${d.newScore}**'
           : '**${d.newScore ?? "Deleted"}**';
 
-      summaryBuf.writeln(
-        '| $icon | `${d.name}` | `$loc` | `$deltaStr` | $scoreStr |',
-      );
-
-      _emitDiagnostic(d, failThreshold, failOnIncrease);
+      buf.writeln('| $icon | `${d.name}` | `$loc` | `$deltaStr` | $scoreStr |');
     }
   }
 
