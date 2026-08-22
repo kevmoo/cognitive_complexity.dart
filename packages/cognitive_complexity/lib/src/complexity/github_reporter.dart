@@ -62,9 +62,12 @@ class GitHubReporter {
       );
 
       if (isViolation) {
+        // Anchor only the declaration line: GitHub renders annotations below
+        // the last line of the range, so a whole-body range would place the
+        // message after the closing brace instead of under the signature.
         _stdoutSink.writeln(
           '::error file=${res.filePath},line=${res.startLine},'
-          'endLine=${res.endLine},title=High Cognitive Complexity '
+          'title=High Cognitive Complexity '
           '(${res.score} > $failThreshold)::${res.name} has score '
           '${res.score} which exceeds failure threshold of $failThreshold.',
         );
@@ -140,6 +143,9 @@ class GitHubReporter {
     return '⚪';
   }
 
+  /// Anchors annotations to the declaration line only: GitHub renders them
+  /// below the last line of the range, so a whole-body range would place the
+  /// message after the closing brace instead of under the signature.
   void _emitDiagnostic(ComplexityDelta d, int? failThreshold, bool failInc) {
     final isVio = d.isViolation(
       failThreshold: failThreshold,
@@ -152,13 +158,13 @@ class GitHubReporter {
           : 'increased in complexity (+${d.delta} points)';
       _stdoutSink.writeln(
         '::error file=${d.filePath},line=${d.startLine},'
-        'endLine=${d.endLine},title=Cognitive Complexity Violation::'
+        'title=Cognitive Complexity Violation::'
         '${d.name} was $reason to score ${d.newScore}.',
       );
     } else if (d.status == DeltaStatus.increased) {
       _stdoutSink.writeln(
         '::warning file=${d.filePath},line=${d.startLine},'
-        'endLine=${d.endLine},title=Cognitive Complexity Increased '
+        'title=Cognitive Complexity Increased '
         '(+${d.delta})::${d.name} increased from ${d.oldScore} to '
         '${d.newScore} (+${d.delta} points).',
       );
