@@ -138,7 +138,7 @@ void main() {
 
       reporter.printReport(deltaSummary: summary);
       check(outBuf.toString()).contains(
-        '::warning file=lib/service.dart,line=12,endLine=40,'
+        '::warning file=lib/service.dart,line=12,'
         'title=Cognitive Complexity Increased (+5)::Service.execute '
         'increased from 5 to 10 (+5 points).',
       );
@@ -167,7 +167,7 @@ void main() {
 
       reporter.printReport(deltaSummary: summary, failThreshold: 15);
       check(outBuf.toString()).contains(
-        '::error file=lib/parser.dart,line=1,endLine=80,'
+        '::error file=lib/parser.dart,line=1,'
         'title=Cognitive Complexity Violation::Parser.parse was '
         'increased in complexity (+15 points) to score 25.',
       );

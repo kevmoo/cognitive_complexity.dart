@@ -1,5 +1,7 @@
 ## 0.2.4-wip
 
+- Anchor GitHub annotations to the declaration line only, so they render
+  under the function signature instead of after the closing brace.
 - Move package into pub workspace monorepo layout under `packages/cognitive_complexity`.
 - Restore root `action.yml` and `skills/` structure for monorepo workspace.
 
